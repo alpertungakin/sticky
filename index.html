@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sticky</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #222;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        canvas {
+            border: 1px solid #555;
+            max-width: 100%;
+            max-height: 100%;
+        }
+        #score {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-size: 20px;
+        }
+        #level {
+            position: absolute;
+            top: 40px;
+            left: 10px;
+            color: white;
+            font-size: 20px;
+        }
+        #gameOver {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 30px;
+            text-align: center;
+            display: none;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 20px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="score">Score: 0</div>
+    <div id="level">Level: 1</div>
+    <div id="gameOver">Game Complete!<br>Final Score: <span id="finalScore"></span>%<br>Click to Restart</div>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const scoreDisplay = document.getElementById('score');
+        const levelDisplay = document.getElementById('level');
+        const gameOverDisplay = document.getElementById('gameOver');
+        const finalScoreDisplay = document.getElementById('finalScore');
+
+        // Audio setup
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        function playSound(type, frequency, duration) {
+            try {
+                const oscillator = audioCtx.createOscillator();
+                oscillator.type = type;
+                oscillator.frequency.setValueAtTime(frequency, audioCtx.currentTime);
+                const gainNode = audioCtx.createGain();
+                gainNode.gain.setValueAtTime(0.3, audioCtx.currentTime);
+                oscillator.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                oscillator.start();
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + duration);
+                oscillator.stop(audioCtx.currentTime + duration);
+            } catch (e) {
+                console.warn('Audio playback failed:', e);
+            }
+        }
+
+        // Particle system for level completion
+        let particles = [];
+        function createParticles(x, y) {
+            for (let i = 0; i < 20; i++) {
+                particles.push({
+                    x, y,
+                    vx: (Math.random() - 0.5) * 5,
+                    vy: (Math.random() - 0.5) * 5,
+                    life: 30
+                });
+            }
+        }
+        function updateParticles() {
+            particles = particles.filter(p => p.life > 0).map(p => {
+                p.x += p.vx;
+                p.y += p.vy;
+                p.life--;
+                return p;
+            });
+        }
+        function drawParticles() {
+            ctx.fillStyle = 'rgba(255, 255, 100, 0.7)';
+            particles.forEach(p => {
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        }
+
+        // Responsive canvas sizing
+        function resizeCanvas() {
+            const size = Math.min(window.innerWidth * 0.9, window.innerHeight * 0.9);
+            canvas.width = size;
+            canvas.height = size;
+            canvas.style.width = `${size}px`;
+            canvas.style.height = 'auto';
+        }
+        resizeCanvas();
+        window.addEventListener('resize', () => {
+            resizeCanvas();
+            initLevel();
+        });
+
+        // Game variables
+        let level = 1;
+        let sticks = [];
+        let targetAngles = [];
+        let midPositions = [];
+        let stickLengths = [];
+        let activeIndex = 0;
+        let speed = 0.05;
+        let stopped = false;
+        let score = 0;
+        let multiplier = 1;
+        let gameOver = false;
+        let centerX = canvas.width / 2;
+        let centerY = canvas.height / 2;
+        let shapeRadius = canvas.width / 4;
+
+        // Level configurations
+        const levels = [
+            { sides: 1, angles: [Math.PI / 4] },
+            { sides: 3, angles: [Math.PI / 2, Math.PI / 2 + (2 * Math.PI / 3), Math.PI / 2 + (4 * Math.PI / 3)] },
+            { sides: 4, angles: [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2] },
+            { sides: 5, angles: Array.from({ length: 5 }, (_, i) => (2 * Math.PI * i) / 5 + Math.PI / 2) },
+            { sides: 6, angles: Array.from({ length: 6 }, (_, i) => (2 * Math.PI * i) / 6 + Math.PI / 2) },
+            { sides: 7, angles: Array.from({ length: 7 }, (_, i) => (2 * Math.PI * i) / 7 + Math.PI / 2) },
+            { sides: 8, angles: Array.from({ length: 8 }, (_, i) => (2 * Math.PI * i) / 8 + Math.PI / 2) },
+        ];
+
+        // Convex hull (Graham's scan)
+        function convexHull(points) {
+            if (!points || points.length < 3) {
+                console.log('Convex hull skipped: insufficient points', points ? points.length : 'undefined');
+                return points || [];
+            }
+            points = points.filter(p => isFinite(p.x) && isFinite(p.y));
+            if (points.length < 3) {
+                console.log('Convex hull skipped: insufficient valid points', points.length);
+                return points;
+            }
+            points.sort((a, b) => a.x === b.x ? a.y - b.y : a.x - b.x);
+            const hull = [];
+            for (let i = 0; i < points.length; i++) {
+                while (hull.length >= 2 && cross(hull[hull.length - 2], hull[hull.length - 1], points[i]) <= 0) {
+                    hull.pop();
+                }
+                hull.push(points[i]);
+            }
+            const lower = hull.length;
+            for (let i = points.length - 2; i >= 0; i--) {
+                while (hull.length > lower && cross(hull[hull.length - 2], hull[hull.length - 1], points[i]) <= 0) {
+                    hull.pop();
+                }
+                hull.push(points[i]);
+            }
+            if (hull.length > 1) hull.pop();
+            console.log('Convex hull computed:', hull.length);
+            return hull;
+        }
+        function cross(p1, p2, p3) {
+            return (p2.x - p1.x) * (p3.y - p1.y) - (p2.y - p1.y) * (p3.x - p1.x);
+        }
+
+        // Polygon area
+        function polygonArea(points) {
+            if (!points || points.length < 3) {
+                console.log('Polygon area skipped: insufficient points', points ? points.length : 'undefined');
+                return 0;
+            }
+            let area = 0;
+            for (let i = 0; i < points.length; i++) {
+                const j = (i + 1) % points.length;
+                area += points[i].x * points[j].y - points[j].x * points[i].y;
+            }
+            area = Math.abs(area / 2);
+            console.log('Polygon area:', area);
+            return area;
+        }
+
+        // IoU calculation
+        function calculateIoU(playerPoints, targetPoints) {
+            try {
+                console.log('calculateIoU input:', { playerPoints: playerPoints.length, targetPoints: targetPoints.length });
+
+                const playerHull = convexHull([...playerPoints]);
+                const targetHull = convexHull([...targetPoints]);
+                console.log('Hulls:', { playerHull: playerHull.length, targetHull: targetHull.length });
+
+                if (playerHull.length < 2 || targetHull.length < 2) {
+                    console.warn('IoU returning 0: insufficient hull points', { playerHull: playerHull.length, targetHull: targetHull.length });
+                    return 0;
+                }
+
+                // Simplified bounding box
+                const minX = Infinity;
+                const maxX = -Infinity;
+                const minY = Infinity;
+                const maxY = -Infinity;
+
+                [...playerHull, ...targetHull].forEach(p => {
+                    minX = Math.min(minX, p.x);
+                    maxX = Math.max(maxX, p.x);
+                    minY = Math.min(minY, p.y);
+                    maxY = Math.max(maxY, p.y);
+                });
+                console.log('Bounding box:', { minX, maxX, minY, maxY });
+
+                if (maxX <= minX || maxY <= minY) {
+                    console.log('IoU returning 0: no intersection');
+                    return 0;
+                }
+
+                const intersectionArea = (maxX - minX) * (maxY - minY);
+                const playerArea = polygonArea(playerHull);
+                const targetArea = polygonArea(targetHull);
+                console.log('Areas:', { intersectionArea, playerArea, targetArea });
+
+                if (playerArea <= 0 || targetArea <= 0) {
+                    console.log('IoU returning 0: zero or negative area');
+                    return 0;
+                }
+
+                const unionArea = playerArea + targetArea - intersectionArea;
+                if (unionArea <= 0) {
+                    console.log('IoU returning 0: zero or negative union area');
+                    return 0;
+                }
+
+                let iou = intersectionArea / unionArea;
+                // Scale IoU to avoid consistently low values
+                iou = Math.min(1, iou * 1.5);
+                console.log('IoU result:', { iou, intersectionArea, unionArea });
+                return Math.max(0, iou);
+            } catch (e) {
+                console.warn('IoU calculation failed:', e);
+                return 0;
+            }
+        }
+
+        // Rotation-based scoring
+        function calculateRotationScore() {
+            let totalError = 0;
+            let stickCount = 0;
+            sticks.forEach((stick, i) => {
+                if (!stick || !isFinite(stick.angle) || !isFinite(targetAngles[i])) {
+                    console.warn('Invalid stick or angle in rotation score:', { stickIndex: i, stick });
+                    return;
+                }
+                let error = Math.abs(stick.angle - targetAngles[i]);
+                // Normalize to smallest angle
+                if (error > Math.PI) error = 2 * Math.PI - error;
+                totalError += error;
+                stickCount++;
+            });
+            if (stickCount === 0) {
+                console.warn('No valid sticks for rotation score');
+                return 0;
+            }
+            const avgError = totalError / stickCount;
+            // Map error from [0, π] to [100%, 0%]
+            const score = Math.max(0, 100 * (1 - avgError / Math.PI));
+            console.log('Rotation score:', { totalError, stickCount, avgError, score });
+            return score;
+        }
+
+        // Initialize level
+        function initLevel() {
+            if (gameOver) return;
+            sticks = [];
+            midPositions = [];
+            targetAngles = [];
+            stickLengths = [];
+            activeIndex = 0;
+            particles = [];
+            const sides = levels[level - 1].sides;
+            shapeRadius = canvas.width / (4 * Math.max(1, multiplier * 0.7));
+            centerX = canvas.width / 2;
+            centerY = canvas.height / 2;
+
+            if (sides === 1) {
+                midPositions.push({ x: centerX, y: centerY });
+                targetAngles.push(levels[level - 1].angles[0]);
+                stickLengths.push(shapeRadius);
+                sticks.push({ angle: Math.random() * Math.PI * 2, stopped: false, midIndex: 0 });
+            } else {
+                const vertexPositions = [];
+                for (let i = 0; i < sides; i++) {
+                    const vertexAngle = (i * 2 * Math.PI) / sides;
+                    const x = centerX + shapeRadius * Math.cos(vertexAngle);
+                    const y = centerY + shapeRadius * Math.sin(vertexAngle);
+                    vertexPositions.push({ x, y });
+                }
+
+                let stickCounter = 0;
+                for (let m = 0; m < multiplier; m++) {
+                    const offsetX = (m - (multiplier - 1) / 2) * shapeRadius * 1.2;
+                    for (let i = 0; i < sides; i++) {
+                        const nextIndex = (i + 1) % sides;
+                        const midX = (vertexPositions[i].x + vertexPositions[nextIndex].x) / 2 + offsetX;
+                        const midY = (vertexPositions[i].y + vertexPositions[nextIndex].y) / 2;
+                        midPositions.push({ x: midX, y: midY });
+
+                        const dx = vertexPositions[nextIndex].x - vertexPositions[i].x;
+                        const dy = vertexPositions[nextIndex].y - vertexPositions[i].y;
+                        const edgeLength = Math.sqrt(dx * dx + dy * dy);
+                        stickLengths.push(edgeLength);
+
+                        const targetAngle = Math.atan2(dy, dx);
+                        targetAngles.push(targetAngle);
+
+                        sticks.push({ angle: Math.random() * Math.PI * 2, stopped: false, midIndex: stickCounter });
+                        stickCounter++;
+                    }
+                }
+            }
+
+            stopped = false;
+            speed = 0.05 + (multiplier > 1 ? (multiplier - 1) * 0.02 : 0);
+            levelDisplay.textContent = `Level: ${level} (x${multiplier})`;
+            console.log('Level initialized:', { 
+                level, 
+                multiplier, 
+                sticks: sticks.length, 
+                midPositions: midPositions.length, 
+                stickLengths: stickLengths.length, 
+                targetAngles: targetAngles.length 
+            });
+        }
+        initLevel();
+
+        // Input handling
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && !stopped && !gameOver) {
+                stopStick();
+            }
+        });
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            if (gameOver) {
+                restartGame();
+                return;
+            }
+            if (!stopped) stopStick();
+        });
+
+        function stopStick() {
+            if (activeIndex < sticks.length && sticks[activeIndex]) {
+                sticks[activeIndex].stopped = true;
+                playSound('sine', 440, 0.1);
+                const error = Math.abs(sticks[activeIndex].angle - targetAngles[activeIndex]);
+                console.log('Stick stopped:', { activeIndex, error, stick: sticks[activeIndex] });
+                if (error < 0.1) {
+                    const pos = midPositions[sticks[activeIndex].midIndex];
+                    ctx.filter = 'blur(2px) brightness(2)';
+                    setTimeout(() => ctx.filter = 'none', 100);
+                }
+                activeIndex++;
+                if (activeIndex >= sticks.length) {
+                    stopped = true;
+                    calculateScore();
+                }
+            } else {
+                console.warn('stopStick error: Invalid activeIndex or stick', { activeIndex, sticksLength: sticks.length });
+            }
+        }
+
+        function calculateScore() {
+            const playerPoints = [];
+            const targetPoints = [];
+
+            sticks.forEach((stick, stickIndex) => {
+                if (!stick) {
+                    console.warn('Invalid stick in calculateScore:', stickIndex);
+                    return;
+                }
+                const midIndex = stick.midIndex;
+                if (midIndex >= midPositions.length || !midPositions[midIndex]) {
+                    console.warn('Invalid midIndex in calculateScore:', { midIndex, midPositionsLength: midPositions.length });
+                    return;
+                }
+                const pos = midPositions[midIndex];
+                const length = stickLengths[midIndex];
+                if (!pos || !length || !isFinite(pos.x) || !isFinite(pos.y) || !isFinite(length)) {
+                    console.warn('Invalid pos or length in calculateScore:', { stickIndex, midIndex, pos, length });
+                    return;
+                }
+
+                // Player stick endpoints
+                const x1 = pos.x - (length / 2) * Math.cos(stick.angle);
+                const y1 = pos.y - (length / 2) * Math.sin(stick.angle);
+                const x2 = pos.x + (length / 2) * Math.cos(stick.angle);
+                const y2 = pos.y + (length / 2) * Math.sin(stick.angle);
+                if (isFinite(x1) && isFinite(y1) && isFinite(x2) && isFinite(y2)) {
+                    playerPoints.push({ x: x1, y: y1 }, { x: x2, y: y2 });
+                } else {
+                    console.warn('Invalid player points:', { x1, y1, x2, y2, stickIndex });
+                }
+
+                // Target stick endpoints
+                const targetAngle = targetAngles[stickIndex];
+                const tx1 = pos.x - (length / 2) * Math.cos(targetAngle);
+                const ty1 = pos.y - (length / 2) * Math.sin(targetAngle);
+                const tx2 = pos.x + (length / 2) * Math.cos(targetAngle);
+                const ty2 = pos.y + (length / 2) * Math.sin(targetAngle);
+                if (isFinite(tx1) && isFinite(ty1) && isFinite(tx2) && isFinite(ty2)) {
+                    targetPoints.push({ x: tx1, y: ty1 }, { x: tx2, y: ty2 });
+                } else {
+                    console.warn('Invalid target points:', { tx1, ty1, tx2, ty2, stickIndex });
+                }
+            });
+
+            console.log('Points collected:', { playerPoints: playerPoints.length, targetPoints: targetPoints.length });
+            let iouPercentage = Math.round(100 * calculateIoU(playerPoints, targetPoints));
+            if (iouPercentage === 0) {
+                console.warn('IoU is 0, using fallback rotation score');
+                iouPercentage = Math.round(calculateRotationScore());
+            }
+            score += iouPercentage;
+            scoreDisplay.textContent = `Score: ${score}%`;
+            console.log('Score calculated:', { iouPercentage, totalScore: score });
+
+            if (level === levels.length && multiplier === 4) {
+                gameOver = true;
+                gameOverDisplay.style.display = 'block';
+                finalScoreDisplay.textContent = score;
+                createParticles(centerX, centerY);
+                playSound('square', 220, 0.5);
+            } else {
+                createParticles(centerX, centerY);
+                playSound('square', 220, 0.5);
+                setTimeout(nextLevel, 1000);
+            }
+        }
+
+        function nextLevel() {
+            level++;
+            if (level > levels.length) {
+                level = 1;
+                speed += 0.02;
+                multiplier++;
+            }
+            levelDisplay.textContent = `Level: ${level} (x${multiplier})`;
+            initLevel();
+        }
+
+        function restartGame() {
+            gameOver = false;
+            gameOverDisplay.style.display = 'none';
+            level = 1;
+            multiplier = 1;
+            score = 0;
+            speed = 0.05;
+            scoreDisplay.textContent = `Score: 0%`;
+            levelDisplay.textContent = `Level: 1`;
+            initLevel();
+        }
+
+        // Animation loop
+        function animate() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            updateParticles();
+
+            if (!gameOver) {
+                if (levels[level - 1].sides > 1) {
+                    const sides = levels[level - 1].sides;
+                    for (let m = 0; m < multiplier; m++) {
+                        const offsetX = (m - (multiplier - 1) / 2) * shapeRadius * 1.2;
+                        ctx.beginPath();
+                        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+                        ctx.lineWidth = 2;
+                        for (let i = 0; i < sides; i++) {
+                            const vertexAngle = (i * 2 * Math.PI) / sides;
+                            const x = centerX + offsetX + shapeRadius * Math.cos(vertexAngle);
+                            const y = centerY + shapeRadius * Math.sin(vertexAngle);
+                            if (i === 0) ctx.moveTo(x, y);
+                            else ctx.lineTo(x, y);
+                        }
+                        ctx.closePath();
+                        ctx.stroke();
+                    }
+                }
+
+                for (let i = 0; i < midPositions.length; i++) {
+                    const pos = midPositions[i];
+                    const angle = targetAngles[i];
+                    const length = stickLengths[i];
+                    const x1 = pos.x - (length / 2) * Math.cos(angle);
+                    const y1 = pos.y - (length / 2) * Math.sin(angle);
+                    const x2 = pos.x + (length / 2) * Math.cos(angle);
+                    const y2 = pos.y + (length / 2) * Math.sin(angle);
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y1);
+                    ctx.lineTo(x2, y2);
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+
+                sticks.forEach((stick, i) => {
+                    if (!stick) {
+                        console.warn('Undefined stick at index:', i);
+                        return;
+                    }
+                    if (i === activeIndex && !stick.stopped) {
+                        stick.angle += speed;
+                        if (stick.angle > Math.PI * 2) stick.angle -= Math.PI * 2;
+                    }
+
+                    const midIndex = stick.midIndex;
+                    if (midIndex >= midPositions.length || !midPositions[midIndex]) {
+                        console.warn('Invalid midIndex for stick:', { i, midIndex, midPositionsLength: midPositions.length });
+                        return;
+                    }
+                    const pos = midPositions[midIndex];
+                    const length = stickLengths[midIndex];
+                    if (!pos || !length) {
+                        console.warn('Invalid pos or length for stick:', { i, midIndex });
+                        return;
+                    }
+                    const x1 = pos.x - (length / 2) * Math.cos(stick.angle);
+                    const y1 = pos.y - (length / 2) * Math.sin(stick.angle);
+                    const x2 = pos.x + (length / 2) * Math.cos(stick.angle);
+                    const y2 = pos.y + (length / 2) * Math.sin(stick.angle);
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y1);
+                    ctx.lineTo(x2, y2);
+                    ctx.strokeStyle = stick.stopped ? 'lime' : (i === activeIndex ? 'white' : 'gray');
+                    ctx.lineWidth = 4;
+                    ctx.stroke();
+                });
+            }
+
+            drawParticles();
+            requestAnimationFrame(animate);
+        }
+        animate();
+    </script>
+</body>
+</html>
